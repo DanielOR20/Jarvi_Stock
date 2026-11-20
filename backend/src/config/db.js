@@ -1,7 +1,14 @@
 import crypto from 'node:crypto';
 import pg from 'pg';
 import { env } from './env.js';
-import { buildSeedData, DEFAULT_TENANT_ID, seedPostgres } from '../db/seed.js';
+import {
+  buildSeedData,
+  DEFAULT_TENANT_ID,
+  FACTORY_TENANT_ID,
+  seedPostgres,
+} from '../db/seed.js';
+
+export { FACTORY_TENANT_ID };
 
 let dbMode = 'memory';
 let pgPool = null;
@@ -67,11 +74,12 @@ export function getDbMode() {
 export async function getTenants() {
   if (dbMode === 'postgres') {
     const { rows } = await pgPool.query(
-      'SELECT * FROM tenants ORDER BY created_at ASC'
+      'SELECT * FROM tenants WHERE id <> $1 ORDER BY created_at ASC',
+      [FACTORY_TENANT_ID]
     );
     return rows;
   }
-  return [...mem.tenants];
+  return mem.tenants.filter((t) => t.id !== FACTORY_TENANT_ID);
 }
 
 export async function getTenant(tenantId = DEFAULT_TENANT_ID) {
@@ -104,6 +112,100 @@ export async function resolveTenantByPhoneNumberId(phoneNumberId) {
   return (
     mem.tenants.find((t) => t.wa_phone_number_id === String(phoneNumberId)) ||
     mem.tenants[0]
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Búsquedas entre negocios. Solo las usa el enrutador del número compartido
+// para decidir a qué negocio va un mensaje; son de solo lectura y no exponen
+// datos de catálogo, pedidos ni costos.
+// ---------------------------------------------------------------------------
+
+// Devuelve el negocio cuyo número propio es phoneNumberId, sin caer al negocio
+// por defecto (a diferencia de resolveTenantByPhoneNumberId).
+export async function findTenantByPhoneNumberId(phoneNumberId) {
+  if (!phoneNumberId) return null;
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      'SELECT * FROM tenants WHERE wa_phone_number_id = $1 LIMIT 1',
+      [String(phoneNumberId)]
+    );
+    return rows[0] || null;
+  }
+  return mem.tenants.find((t) => t.wa_phone_number_id === String(phoneNumberId)) || null;
+}
+
+export async function findAgentByCode(code) {
+  const wanted = String(code || '').trim().toUpperCase();
+  if (!wanted) return null;
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      'SELECT * FROM agents WHERE UPPER(activation_code) = $1 AND tenant_id <> $2 LIMIT 1',
+      [wanted, FACTORY_TENANT_ID]
+    );
+    return rows[0] || null;
+  }
+  return (
+    mem.agents.find(
+      (a) =>
+        a.tenant_id !== FACTORY_TENANT_ID &&
+        String(a.activation_code || '').toUpperCase() === wanted
+    ) || null
+  );
+}
+
+// Negocios de los que este teléfono es dueño, el más reciente primero.
+export async function findOwnedTenants(phone) {
+  const digits = normalizePhone(phone);
+  if (!digits) return [];
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `SELECT t.* FROM tenants t
+       JOIN users u ON u.tenant_id = t.id
+       WHERE u.phone = $1 AND u.role = 'owner' AND t.id <> $2
+       ORDER BY t.created_at DESC`,
+      [digits, FACTORY_TENANT_ID]
+    );
+    return rows;
+  }
+  const ownedIds = new Set(
+    mem.users
+      .filter((u) => u.role === 'owner' && normalizePhone(u.phone) === digits)
+      .map((u) => u.tenant_id)
+  );
+  return mem.tenants
+    .filter((t) => t.id !== FACTORY_TENANT_ID && ownedIds.has(t.id))
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+}
+
+// Conversación más reciente de este teléfono con un agente (dueño o cliente)
+// dentro de la ventana indicada. Excluye las entrevistas de la fábrica.
+export async function findLatestAgentConversation(phone, withinMinutes) {
+  const digits = normalizePhone(phone);
+  if (!digits) return null;
+  const since = new Date(Date.now() - withinMinutes * 60 * 1000);
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `SELECT * FROM conversations
+       WHERE participant_phone = $1 AND tenant_id <> $2
+         AND channel_mode IN ('owner', 'client') AND last_message_at >= $3
+       ORDER BY last_message_at DESC
+       LIMIT 1`,
+      [digits, FACTORY_TENANT_ID, since.toISOString()]
+    );
+    return rows[0] || null;
+  }
+  return (
+    mem.conversations
+      .filter(
+        (c) =>
+          c.participant_phone === digits &&
+          c.tenant_id !== FACTORY_TENANT_ID &&
+          (c.channel_mode === 'owner' || c.channel_mode === 'client') &&
+          new Date(c.last_message_at) >= since
+      )
+      .sort((a, b) => String(b.last_message_at).localeCompare(String(a.last_message_at)))[0] ||
+    null
   );
 }
 
@@ -602,6 +704,53 @@ export async function toggleAgent(tenantId, agentId) {
   return agent;
 }
 
+// Crea un negocio nuevo a partir de la entrevista de la fábrica. Cada
+// entrevista completada produce su propio tenant: nunca reutiliza uno existente.
+export async function createTenantFromOnboarding(payload) {
+  const {
+    businessName,
+    businessIndustry = 'Comercio sin inventario propio',
+    activationName = 'Jarvis',
+    defaultMargin = 40,
+    handoffRule = 'Escalar al dueño por WhatsApp y pausar respuestas automáticas',
+  } = payload;
+
+  const tenant = {
+    id: crypto.randomUUID(),
+    name: String(businessName || 'Negocio nuevo').slice(0, 140),
+    business_industry: String(businessIndustry).slice(0, 160),
+    activation_name: String(activationName || 'Jarvis').slice(0, 60),
+    default_margin: Number(defaultMargin),
+    handoff_rule: handoffRule,
+    wa_phone_number_id: null,
+    status: 'onboarding',
+    monthly_msg_limit: 1500,
+    created_at: new Date().toISOString(),
+  };
+
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `INSERT INTO tenants (id, name, business_industry, activation_name, default_margin, handoff_rule, status, monthly_msg_limit)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [
+        tenant.id,
+        tenant.name,
+        tenant.business_industry,
+        tenant.activation_name,
+        tenant.default_margin,
+        tenant.handoff_rule,
+        tenant.status,
+        tenant.monthly_msg_limit,
+      ]
+    );
+    return rows[0];
+  }
+
+  mem.tenants.push(tenant);
+  return tenant;
+}
+
 export async function deployOnboardingAgents(tenantId, payload) {
   const {
     businessName,
@@ -617,8 +766,8 @@ export async function deployOnboardingAgents(tenantId, payload) {
     .replace(/[^a-zA-Z0-9]/g, '')
     .slice(0, 4)
     .toUpperCase() || 'JARV';
-  const personalCode = `JRV-${codePrefix}-${Math.floor(1000 + Math.random() * 8999)}`;
-  const publicCode = `JRV-PUB-${Math.floor(1000 + Math.random() * 8999)}`;
+  const personalCode = `JRV-${codePrefix}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+  const publicCode = `JRV-PUB-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
   if (dbMode === 'postgres') {
     await pgPool.query(
@@ -1060,6 +1209,40 @@ export async function getPendingActionById(tenantId, actionId) {
     mem.pending_actions.find((pa) => pa.tenant_id === tenantId && pa.id === actionId) ||
     null
   );
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Busca una acción solo por su id, sin conocer el negocio (lo usa el botón de
+// WhatsApp, que solo trae el id). Es la única consulta sin filtro de tenant_id:
+// quien la llama DEBE comprobar enseguida que el teléfono es dueño del negocio
+// de la acción (action.tenant_id) antes de mostrar o ejecutar nada.
+export async function findPendingActionForDecision(actionId) {
+  const id = String(actionId || '');
+  if (!UUID_RE.test(id)) return null;
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      'SELECT * FROM pending_actions WHERE id = $1 LIMIT 1',
+      [id]
+    );
+    return rows[0] || null;
+  }
+  return mem.pending_actions.find((pa) => pa.id === id) || null;
+}
+
+// Teléfonos de los dueños (rol owner) de un negocio.
+export async function listOwnerPhones(tenantId) {
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `SELECT phone FROM users WHERE tenant_id = $1 AND role = 'owner' ORDER BY created_at`,
+      [tenantId]
+    );
+    return rows.map((r) => normalizePhone(r.phone)).filter(Boolean);
+  }
+  return mem.users
+    .filter((u) => u.tenant_id === tenantId && u.role === 'owner')
+    .map((u) => normalizePhone(u.phone))
+    .filter(Boolean);
 }
 
 export async function markPendingActionDecision(tenantId, actionId, decision) {

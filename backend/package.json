@@ -11,9 +11,11 @@
     "seed": "node src/db/seed.js"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^1.12.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "pg": "^8.13.3"
+    "pg": "^8.13.3",
+    "qrcode": "^1.5.4"
   }
 }

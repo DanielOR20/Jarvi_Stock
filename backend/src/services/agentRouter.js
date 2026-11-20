@@ -3,7 +3,9 @@ import {
   calculateMargin,
   createOrder,
   createPendingAction,
+  createTenantFromOnboarding,
   deployOnboardingAgents,
+  FACTORY_TENANT_ID,
   findActiveOnboardingConversation,
   findUserByPhone,
   getDailyPickupRoute,
@@ -17,16 +19,21 @@ import {
   normalizePhone,
   updateConversation,
 } from '../config/db.js';
+import { resolveRoute, stripAgentCode } from './messageRouter.js';
+import { buildAgentQrUrl, buildAgentWaLink } from './shareLinks.js';
+import {
+  buildDecisionButtons,
+  buildPendingActionSummary,
+  formatColones,
+  notifyOwnersOfPendingAction,
+} from './pendingActions.js';
+import { interpretOwnerMessage } from './ownerIntent.js';
 
 function normalizeText(value) {
   return String(value || '')
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '');
-}
-
-function formatColones(value) {
-  return `₡${Math.round(Number(value) || 0).toLocaleString('en-US')}`;
 }
 
 function findMatchingProducts(query, productList) {
@@ -170,24 +177,30 @@ function toPublicProduct(product) {
   };
 }
 
-async function handleOnboardingStep(tenant, fromPhone, text, existingConv) {
+// La entrevista vive en el negocio interno de la fábrica (FACTORY_TENANT_ID).
+// Al terminar crea un negocio NUEVO cuyo dueño es quien escribió (fromPhone):
+// el dueño nunca se escribe a mano, para que nadie pueda apropiarse de otro número.
+const ONBOARDING_TOTAL = 4;
+
+function onboardingReply(replyText) {
+  return { replyText, replyMediaUrl: null, createdPendingAction: null, mode: 'onboarding' };
+}
+
+async function handleOnboardingStep(fromPhone, text, existingConv) {
+  const tenantId = FACTORY_TENANT_ID;
   const conv =
-    existingConv || (await getOrCreateConversation(tenant.id, fromPhone, 'onboarding'));
+    existingConv || (await getOrCreateConversation(tenantId, fromPhone, 'onboarding'));
   const normalized = normalizeText(text).trim();
 
   if (!existingConv || normalized.includes('#onboarding') || normalized.includes('#activar')) {
-    await updateConversation(tenant.id, conv.id, {
+    await updateConversation(tenantId, conv.id, {
       channel_mode: 'onboarding',
       onboarding_step: 1,
       context_json: {},
     });
-    return {
-      replyText:
-        '¡Hola! Soy el configurador de Jarvi Stock (5 preguntas rápidas).\n\nPregunta 1/5: ¿Cuál es el nombre de tu negocio y su giro comercial? (Ej. "Repuestos MotoASAP - Repuestos de moto")',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    return onboardingReply(
+      `¡Hola! Soy el configurador de Jarvi Stock (${ONBOARDING_TOTAL} preguntas rápidas). Al terminar tendrás tu propio negocio con dos agentes, y este número quedará como dueño.\n\nPregunta 1/${ONBOARDING_TOTAL}: ¿Cuál es el nombre de tu negocio y su giro comercial? (Ej. "Repuestos MotoASAP - Repuestos de moto")`
+    );
   }
 
   const step = conv.onboarding_step || 1;
@@ -195,83 +208,125 @@ async function handleOnboardingStep(tenant, fromPhone, text, existingConv) {
 
   if (step === 1) {
     const parts = text.split(/[-–|]/);
-    ctx.businessName = (parts[0] || text).trim();
+    ctx.businessName = (parts[0] || text).trim() || 'Negocio nuevo';
     ctx.businessIndustry = (parts[1] || 'Comercio sin inventario propio').trim();
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 2,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 2/5: ¿Con qué nombre quieres activar a tu asistente privado? (Ej. "Jarvis")',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    await updateConversation(tenantId, conv.id, { onboarding_step: 2, context_json: ctx });
+    return onboardingReply(
+      `Pregunta 2/${ONBOARDING_TOTAL}: ¿Con qué nombre quieres activar a tu asistente privado? (Ej. "Jarvis")`
+    );
   }
 
   if (step === 2) {
-    ctx.activationName = text.trim() || 'Jarvis';
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 3,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 3/5: Confirma el número WhatsApp del dueño autorizado (ej. 50688888888):',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    ctx.activationName = text.trim().slice(0, 60) || 'Jarvis';
+    await updateConversation(tenantId, conv.id, { onboarding_step: 3, context_json: ctx });
+    return onboardingReply(
+      `Pregunta 3/${ONBOARDING_TOTAL}: ¿Qué margen de ganancia (%) sugerido deseas por defecto? (Ej. 35)`
+    );
   }
 
   if (step === 3) {
-    ctx.ownerWhatsapp = normalizePhone(text) || normalizePhone(fromPhone);
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 4,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 4/5: ¿Qué margen de ganancia (%) sugerido deseas por defecto? (Ej. 35)',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
-  }
-
-  if (step === 4) {
     const numMatch = text.match(/(\d+(?:[.,]\d+)?)/);
-    ctx.defaultMargin = numMatch ? Math.min(90, Math.max(5, Number(numMatch[1]))) : 40;
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 5,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 5/5: ¿Qué regla aplicamos si un cliente pregunta por algo fuera de catálogo? (Ej. "Escalar al dueño por WhatsApp")',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    ctx.defaultMargin = numMatch
+      ? Math.min(90, Math.max(5, Number(numMatch[1].replace(',', '.'))))
+      : 40;
+    await updateConversation(tenantId, conv.id, { onboarding_step: 4, context_json: ctx });
+    return onboardingReply(
+      `Pregunta 4/${ONBOARDING_TOTAL}: ¿Qué regla aplicamos si un cliente pregunta por algo fuera de catálogo? (Ej. "Escalar al dueño por WhatsApp")`
+    );
   }
 
   ctx.handoffRule =
     text.trim() || 'Escalar al dueño por WhatsApp y pausar respuestas automáticas';
+  // El dueño es siempre quien completó la entrevista.
+  ctx.ownerWhatsapp = normalizePhone(fromPhone);
 
-  const deployed = await deployOnboardingAgents(tenant.id, ctx);
-  await updateConversation(tenant.id, conv.id, {
-    channel_mode: 'owner',
-    onboarding_step: null,
-    context_json: ctx,
-  });
+  const newTenant = await createTenantFromOnboarding(ctx);
+  const deployed = await deployOnboardingAgents(newTenant.id, ctx);
+  await updateConversation(tenantId, conv.id, { onboarding_step: null, context_json: ctx });
+
+  const publicCode = deployed.agents?.attention?.activation_code;
+  const shareLink = buildAgentWaLink(publicCode);
+  const qrUrl = buildAgentQrUrl(publicCode);
+
+  // El código privado no se manda por chat: el dueño ya se reconoce por su número.
+  const lines = [
+    `¡Listo! Creamos tu negocio "${ctx.businessName}" con dos agentes:`,
+    `1) Tu asistente privado "${ctx.activationName}": solo te responde a ti. Escríbele desde este número mencionando "${ctx.activationName}".`,
+    `2) Tu agente de atención: responde a tus clientes sin mostrar costos ni proveedores.`,
+    '',
+    shareLink
+      ? `Comparte este enlace con tus clientes:\n${shareLink}`
+      : `Tus clientes deben escribir este código a nuestro número: ${publicCode}`,
+  ];
+  if (qrUrl) lines.push('', 'Este QR lleva al mismo enlace: imprímelo o ponlo en tus redes.');
+  lines.push('', `Tope mensual: ${deployed.usageCaps.monthlyMsgLimit} mensajes.`);
 
   return {
-    replyText: `¡Listo! Desplegamos tus dos agentes para "${ctx.businessName}":\n1) Asistente privado "${ctx.activationName}" (Código: ${deployed.activationCode})\n2) Agente público de atención al cliente (oculta costos y proveedores).\nTope mensual: ${deployed.usageCaps.monthlyMsgLimit} mensajes.`,
-    replyMediaUrl: null,
-    createdPendingAction: null,
-    mode: 'onboarding',
-    onboardingResult: deployed,
+    ...onboardingReply(lines.join('\n')),
+    replyMediaUrl: qrUrl,
+    onboardingResult: { ...deployed, publicCode, shareLink, qrUrl },
+  };
+}
+
+// "sí", "aprobar", "rechazo"... sin decir cuál acción. Nunca se ejecuta nada
+// con un texto así: la confirmación se liga a una acción concreta (botón).
+const DECISION_WORDS = new Set([
+  'si', 'aprobar', 'apruebo', 'aprueba', 'aprobado', 'aprobada', 'confirmar', 'confirmo',
+  'confirma', 'ok', 'okay', 'dale', 'listo', 'rechazar', 'rechazo', 'rechaza', 'no',
+  'cancelar', 'cancela', 'cancelo',
+]);
+const DECISION_FILLER = new Set([
+  'la', 'el', 'lo', 'eso', 'esa', 'esta', 'por', 'favor', 'accion', 'pedido', 'orden',
+]);
+
+function isBareDecisionText(text, wakeWord) {
+  const wake = normalizeText(wakeWord).trim();
+  const tokens = normalizeText(text)
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t && t !== wake);
+  return (
+    tokens.length > 0 &&
+    tokens.length <= 5 &&
+    tokens.some((t) => DECISION_WORDS.has(t)) &&
+    tokens.every((t) => DECISION_WORDS.has(t) || DECISION_FILLER.has(t))
+  );
+}
+
+function ownerReply(replyText, extra = {}) {
+  return { replyText, replyMediaUrl: null, createdPendingAction: null, mode: 'owner', ...extra };
+}
+
+function findSupplierByName(suppliers, name) {
+  if (!name) return null;
+  return suppliers.find((s) => normalizeText(s.name) === normalizeText(name)) || null;
+}
+
+// Datos que faltan para registrar un producto. Con IA no se inventan precios
+// ni proveedores: se le pregunta al dueño.
+function missingProductFields(ai, suppliers) {
+  const missing = [];
+  if (!ai.costPrice && !ai.salePrice) missing.push('el costo');
+  if (!ai.supplierName) missing.push('el proveedor');
+  else if (!ai.supplierPhone && !findSupplierByName(suppliers, ai.supplierName)?.whatsapp_phone) {
+    missing.push(`el WhatsApp de ${ai.supplierName}`);
+  }
+  return missing;
+}
+
+// Convierte la intención de la IA al mismo formato que parseOwnerSaveCommand().
+function intentToSaveCommand(ai, suppliers, defaultMarginPct) {
+  if (ai.intent !== 'create_product') return null;
+  const margin = Math.max(0.1, 1 - defaultMarginPct / 100);
+  const costPrice = ai.costPrice || Math.round(ai.salePrice * margin);
+  const salePrice = ai.salePrice || Math.round(costPrice / margin);
+  const known = findSupplierByName(suppliers, ai.supplierName);
+  return {
+    productName: ai.productName.charAt(0).toUpperCase() + ai.productName.slice(1),
+    costPrice,
+    salePrice,
+    supplierName: known?.name || ai.supplierName,
+    supplierPhone: ai.supplierPhone || known?.whatsapp_phone,
   };
 }
 
@@ -284,8 +339,51 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
     listPendingActions(tenant.id, 'pending'),
   ]);
 
-  const parsedSave = parseOwnerSaveCommand(text, defaultMargin);
-  if (parsedSave || mediaUrl) {
+  if (!mediaUrl && isBareDecisionText(text, wakeWord)) {
+    if (pending.length === 0) {
+      return ownerReply('No tienes acciones pendientes por confirmar.');
+    }
+    if (pending.length === 1) {
+      // Se vuelve a preguntar con los botones de ESA acción; no se ejecuta nada.
+      const only = pending[0];
+      return ownerReply(
+        `Para confirmar usa los botones de la acción:\n\n${buildPendingActionSummary(only, {
+          tenantName: tenant.name,
+        })}`,
+        { replyButtons: buildDecisionButtons(only.id) }
+      );
+    }
+    const list = pending
+      .slice(0, 5)
+      .map((pa, i) => `${i + 1}. ${pa.payload_json?.title || pa.action_type}`)
+      .join('\n');
+    return ownerReply(
+      `Tienes ${pending.length} acciones pendientes y no sé a cuál te refieres, así que no ejecuté nada:\n${list}${
+        pending.length > 5 ? '\n…' : ''
+      }\n\nUsa el botón Aprobar o Rechazar del aviso de cada una (o el panel).`
+    );
+  }
+
+  // Con IA: entiende lenguaje natural ("me llegó X de MotoASAP a 18 mil").
+  // Sin IA (o si falla): reglas por palabras clave, como antes.
+  const ai = await interpretOwnerMessage({ text, hasImage: Boolean(mediaUrl) });
+
+  if (ai?.intent === 'create_product') {
+    const missing = missingProductFields(ai, suppliers);
+    if (missing.length > 0) {
+      return {
+        replyText: `Para registrar "${ai.productName}" me falta: ${missing.join(', ')}. Envíamelo en un solo mensaje y lo preparo para tu confirmación.`,
+        replyMediaUrl: null,
+        createdPendingAction: null,
+        mode: 'owner',
+      };
+    }
+  }
+
+  const parsedSave = ai
+    ? intentToSaveCommand(ai, suppliers, defaultMargin)
+    : parseOwnerSaveCommand(text, defaultMargin);
+  if (parsedSave || (mediaUrl && !ai)) {
     const productName = parsedSave?.productName || 'Producto detectado por imagen';
     const costPrice = parsedSave?.costPrice || 12000;
     const salePrice =
@@ -353,7 +451,10 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
   }
 
   const normalized = normalizeText(text);
-  if (normalized.includes('ruta') || normalized.includes('recogida')) {
+  const wantsRoute = ai
+    ? ai.intent === 'pickup_route'
+    : normalized.includes('ruta') || normalized.includes('recogida');
+  if (wantsRoute) {
     const stops = await getDailyPickupRoute(tenant.id);
     if (stops.length === 0) {
       return {
@@ -379,12 +480,14 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
     };
   }
 
-  const matched = findMatchingProducts(text, products);
-  const wantsPurchase =
-    normalized.includes('pide') ||
-    normalized.includes('pedir') ||
-    normalized.includes('ordena') ||
-    normalized.includes('compra');
+  const searchText = ai?.searchQuery || text;
+  const matched = findMatchingProducts(searchText, products);
+  const wantsPurchase = ai
+    ? ai.intent === 'purchase_order'
+    : normalized.includes('pide') ||
+      normalized.includes('pedir') ||
+      normalized.includes('ordena') ||
+      normalized.includes('compra');
 
   if (matched.length > 0) {
     const top = matched[0];
@@ -454,7 +557,7 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
       ...pa.payload_json.product,
       supplier_name: pa.payload_json.supplierName || 'Proveedor Local',
     }));
-  const matchedPending = findMatchingProducts(text, pendingProducts);
+  const matchedPending = findMatchingProducts(searchText, pendingProducts);
   if (matchedPending.length > 0) {
     const p = matchedPending[0];
     return {
@@ -519,6 +622,12 @@ async function handleClientMode(tenant, fromPhone, text) {
         agentName: 'Agente Atención al Cliente',
         supplierId: chosen.supplier_id,
         supplierName: chosen.supplier_name,
+        // Lo que recibe el proveedor al aprobar. Sin datos del cliente.
+        supplierMessage: `Hola ${chosen.supplier_name}, le escribe ${tenant.name}. Quisiéramos pedirle ${quantity}x "${chosen.name}"${
+          chosen.sku ? ` (SKU ${chosen.sku})` : ''
+        } a ${formatColones(chosen.cost_price)} c/u. ¿Lo tiene disponible para recoger hoy${
+          chosen.supplier?.location ? ` en ${chosen.supplier.location}` : ''
+        }? Gracias.`,
         nextStage: 'pedido_proveedor',
         impactSummary: `Costo ${formatColones(totalCost)} · Venta ${formatColones(
           totalSale
@@ -586,54 +695,138 @@ async function handleClientMode(tenant, fromPhone, text) {
   };
 }
 
+// Rutas del simulador del CRM: el negocio viene fijado por el panel.
+async function resolveLegacyRoute(tenantId, fromPhone, text, forceMode) {
+  const normalized = normalizeText(text).trim();
+  const inProgress = await findActiveOnboardingConversation(FACTORY_TENANT_ID, fromPhone);
+  if (normalized.startsWith('#onboarding') || normalized.startsWith('#activar')) {
+    return { tenantId: FACTORY_TENANT_ID, mode: 'onboarding', reason: 'factory_command' };
+  }
+  if (inProgress || forceMode === 'onboarding') {
+    return {
+      tenantId: FACTORY_TENANT_ID,
+      mode: 'onboarding',
+      reason: inProgress ? 'onboarding_in_progress' : 'factory_command',
+    };
+  }
+  if (forceMode) return { tenantId, mode: forceMode, reason: 'forced' };
+  const user = await findUserByPhone(tenantId, fromPhone);
+  return { tenantId, mode: user?.role === 'owner' ? 'owner' : 'client', reason: 'simulator' };
+}
+
+/**
+ * Procesa un mensaje entrante.
+ * - Sin tenantId (número compartido): decide el negocio con resolveRoute().
+ * - Con tenantId (simulador del panel o número propio del negocio): usa ese negocio.
+ * - `route` permite pasar una ruta ya calculada (el webhook la calcula antes
+ *   de guardar el mensaje entrante).
+ */
 export async function processMessage({
-  tenantId,
+  tenantId = null,
   fromPhone,
   messageId = null,
   text = '',
   mediaUrl = null,
   timestamp = new Date().toISOString(),
   forceMode = null,
+  route = null,
+  // El simulador del panel lo pone en false: probar no debe mandar avisos
+  // reales por WhatsApp a los dueños.
+  notifyOwners = true,
 }) {
-  const tenant = await getTenant(tenantId);
+  const resolved =
+    route ||
+    (tenantId
+      ? await resolveLegacyRoute(tenantId, fromPhone, text, forceMode)
+      : await resolveRoute({ fromPhone, text }));
+
+  const mode = resolved.mode;
+  const tenant = await getTenant(resolved.tenantId);
   if (!tenant) {
     throw new Error('Tenant no encontrado.');
   }
 
-  const normalized = normalizeText(text).trim();
-  const activeOnboarding = await findActiveOnboardingConversation(tenant.id, fromPhone);
-  const startsOnboarding =
-    normalized.startsWith('#onboarding') || normalized.startsWith('#activar');
-
-  let mode = forceMode;
-  if (!mode) {
-    if (activeOnboarding || startsOnboarding) {
-      mode = 'onboarding';
-    } else {
-      const user = await findUserByPhone(tenant.id, fromPhone);
-      mode = user?.role === 'owner' ? 'owner' : 'client';
+  // Si el cliente llegó con un código, abandona cualquier entrevista a medias.
+  if (resolved.code) {
+    const pending = await findActiveOnboardingConversation(FACTORY_TENANT_ID, fromPhone);
+    if (pending) {
+      await updateConversation(FACTORY_TENANT_ID, pending.id, { onboarding_step: null });
     }
   }
 
-  const agents = await listAgents(tenant.id);
-  const selectedAgent = agents.find((a) =>
-    mode === 'owner' ? a.type === 'personal' : a.type === 'attention'
-  );
+  const convMode = ['owner', 'client', 'onboarding'].includes(mode) ? mode : 'client';
+  let selectedAgentId = resolved.agentId || null;
+  if (!selectedAgentId && (mode === 'owner' || mode === 'client')) {
+    const agents = await listAgents(tenant.id);
+    selectedAgentId =
+      agents.find((a) => (mode === 'owner' ? a.type === 'personal' : a.type === 'attention'))
+        ?.id || null;
+  }
+
+  // Solo se continúa una entrevista si la ruta lo dice; en otro caso empieza de
+  // cero (aunque el webhook ya haya creado la fila de la conversación).
+  const activeOnboarding =
+    mode === 'onboarding' && resolved.reason === 'onboarding_in_progress'
+      ? await findActiveOnboardingConversation(FACTORY_TENANT_ID, fromPhone)
+      : null;
 
   const conversation = await getOrCreateConversation(
     tenant.id,
     fromPhone,
-    mode,
-    selectedAgent?.id || null
+    convMode,
+    selectedAgentId
   );
 
+  // El código solo sirve para elegir el agente; no se interpreta como consulta.
+  const body = resolved.code ? stripAgentCode(text) : text;
+
   let result;
-  if (mode === 'onboarding') {
-    result = await handleOnboardingStep(tenant, fromPhone, text, activeOnboarding);
+  if (mode === 'unavailable') {
+    result = {
+      replyText: 'Este negocio no está atendiendo por WhatsApp en este momento. Intenta más tarde.',
+      replyMediaUrl: null,
+      createdPendingAction: null,
+      mode,
+    };
+  } else if (mode === 'onboarding') {
+    result = await handleOnboardingStep(fromPhone, text, activeOnboarding);
+  } else if (resolved.code && !body && !mediaUrl) {
+    result = {
+      replyText:
+        mode === 'owner'
+          ? `Hola, soy ${tenant.activation_name || 'Jarvis'}, tu asistente de ${tenant.name}. ¿Qué necesitas?`
+          : `¡Hola! Bienvenido a ${tenant.name}. ¿Qué producto buscas?`,
+      replyMediaUrl: null,
+      createdPendingAction: null,
+      mode,
+    };
   } else if (mode === 'owner') {
-    result = await handleOwnerMode(tenant, fromPhone, text, mediaUrl);
+    result = await handleOwnerMode(tenant, fromPhone, body, mediaUrl);
   } else {
-    result = await handleClientMode(tenant, fromPhone, text);
+    result = await handleClientMode(tenant, fromPhone, body);
+  }
+
+  if (result.createdPendingAction) {
+    if (mode === 'owner') {
+      // El propio dueño pidió la acción: su respuesta lleva los botones.
+      result.replyButtons = buildDecisionButtons(result.createdPendingAction.id);
+      result.replyText += '\n\nPuedes decidir aquí con los botones o desde el panel.';
+    } else if (!notifyOwners) {
+      result.ownerNotifications = { skipped: 'simulator' };
+    } else {
+      // Nació de un cliente: se avisa a los dueños. Si el aviso falla, el
+      // cliente igual recibe su respuesta y la acción queda en el panel.
+      try {
+        result.ownerNotifications = await notifyOwnersOfPendingAction({
+          tenant,
+          action: result.createdPendingAction,
+          customerPhone: fromPhone,
+          order: result.createdOrder || null,
+        });
+      } catch (err) {
+        console.error('[agentRouter] Error avisando al dueño:', err);
+      }
+    }
   }
 
   await insertOutboundMessage(tenant.id, {
@@ -648,5 +841,6 @@ export async function processMessage({
     ...result,
     timestamp,
     tenantId: tenant.id,
+    route: { mode, reason: resolved.reason },
   };
 }

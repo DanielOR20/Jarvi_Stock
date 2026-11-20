@@ -1,9 +1,15 @@
 import express from 'express';
 import cors from 'cors';
-import { env, isWhatsappConfigured } from './config/env.js';
+import {
+  env,
+  isAppSecretConfigured,
+  isUnsignedWebhookAllowed,
+  isWhatsappConfigured,
+} from './config/env.js';
 import { getDbMode, initDb } from './config/db.js';
 import webhookRoutes from './routes/webhook.routes.js';
 import crmRoutes from './routes/crm.routes.js';
+import publicRoutes from './routes/public.routes.js';
 
 const app = express();
 
@@ -45,6 +51,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/webhook', webhookRoutes);
+app.use('/api/public', publicRoutes);
 app.use('/api', crmRoutes);
 
 app.use((req, res) => {
@@ -67,6 +74,14 @@ app.use((err, _req, res, _next) => {
 });
 
 await initDb();
+
+if (!isAppSecretConfigured()) {
+  console.warn(
+    isUnsignedWebhookAllowed()
+      ? '[seguridad] WEBHOOK_ALLOW_UNSIGNED activo: se aceptan webhooks SIN firma (solo pruebas locales).'
+      : '[seguridad] Falta WHATSAPP_APP_SECRET: todos los webhooks de Meta serán rechazados (401).'
+  );
+}
 
 app.listen(env.port, () => {
   console.log(

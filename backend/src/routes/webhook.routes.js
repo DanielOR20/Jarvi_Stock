@@ -1,21 +1,36 @@
 import crypto from 'node:crypto';
 import express from 'express';
-import { env, isAppSecretConfigured, isWhatsappConfigured } from '../config/env.js';
+import {
+  env,
+  isAppSecretConfigured,
+  isUnsignedWebhookAllowed,
+  isWhatsappConfigured,
+} from '../config/env.js';
 import {
   getOrCreateConversation,
   insertInboundMessage,
+  findTenantByPhoneNumberId,
   normalizePhone,
-  resolveTenantByPhoneNumberId,
 } from '../config/db.js';
 import { processMessage } from '../services/agentRouter.js';
-import { sendMediaMessage, sendTextMessage } from '../services/whatsappOutbound.js';
+import { resolveRoute } from '../services/messageRouter.js';
+import { handleDecisionButton } from '../services/pendingActions.js';
+import {
+  sendInteractiveButtons,
+  sendMediaMessage,
+  sendTextMessage,
+} from '../services/whatsappOutbound.js';
 
 const router = express.Router();
 
 function verifyMetaSignature(req) {
   const header = req.headers['x-hub-signature-256'];
-  if (!isAppSecretConfigured() && !header) {
+  if (isUnsignedWebhookAllowed() && !header) {
     return true;
+  }
+  if (!isAppSecretConfigured()) {
+    console.error('[webhook] WHATSAPP_APP_SECRET no configurado: se rechaza la petición.');
+    return false;
   }
   if (!header || !req.rawBody) {
     return false;
@@ -58,7 +73,13 @@ async function processWebhookPayloadAsync(body) {
     for (const change of changes) {
       const value = change?.value;
       const phoneNumberId = value?.metadata?.phone_number_id || null;
-      const tenant = await resolveTenantByPhoneNumberId(phoneNumberId);
+      // Un número propio de un negocio va directo a ese negocio. El número
+      // compartido (WHATSAPP_PHONE_NUMBER_ID) pasa por el enrutador.
+      const numberTenant = await findTenantByPhoneNumberId(phoneNumberId);
+      const dedicatedTenant =
+        numberTenant && String(phoneNumberId) !== env.whatsapp.phoneNumberId
+          ? numberTenant
+          : null;
       const messages = Array.isArray(value?.messages) ? value.messages : [];
 
       for (const msg of messages) {
@@ -83,10 +104,36 @@ async function processWebhookPayloadAsync(body) {
             msg?.interactive?.button_reply?.title ||
             msg?.interactive?.list_reply?.title ||
             '';
+          // Botón Aprobar/Rechazar de una pending action: se atiende ANTES del
+          // enrutador normal. El negocio sale de la acción, no del mensaje.
+          const decision = await handleDecisionButton({
+            fromPhone,
+            buttonId: msg?.interactive?.button_reply?.id,
+            waMessageId,
+            buttonTitle: text,
+            rawPayload: msg,
+          });
+          if (decision) {
+            if (decision.duplicate) {
+              console.log(`[webhook] Duplicado descartado wa_message_id=${waMessageId}`);
+            }
+            for (const body of decision.replies) {
+              await sendTextMessage({ toPhone: fromPhone, body });
+            }
+            continue;
+          }
         }
 
-        const conv = await getOrCreateConversation(tenant.id, fromPhone, 'client');
-        const { inserted } = await insertInboundMessage(tenant.id, {
+        const route = dedicatedTenant
+          ? null
+          : await resolveRoute({ fromPhone, text });
+        const storeTenantId = route ? route.tenantId : dedicatedTenant.id;
+        const storeMode =
+          route && ['owner', 'client', 'onboarding'].includes(route.mode)
+            ? route.mode
+            : 'client';
+        const conv = await getOrCreateConversation(storeTenantId, fromPhone, storeMode);
+        const { inserted } = await insertInboundMessage(storeTenantId, {
           conversation_id: conv.id,
           wa_message_id: waMessageId,
           sender_phone: fromPhone,
@@ -102,7 +149,8 @@ async function processWebhookPayloadAsync(body) {
         }
 
         const result = await processMessage({
-          tenantId: tenant.id,
+          tenantId: dedicatedTenant ? dedicatedTenant.id : null,
+          route,
           fromPhone,
           messageId: waMessageId,
           text,
@@ -112,13 +160,27 @@ async function processWebhookPayloadAsync(body) {
             : new Date().toISOString(),
         });
 
+        let sentMedia = false;
         if (result?.replyMediaUrl) {
-          await sendMediaMessage({
+          const media = await sendMediaMessage({
             toPhone: fromPhone,
             mediaUrl: result.replyMediaUrl,
             caption: result.replyText || '',
           });
-        } else if (result?.replyText) {
+          sentMedia = media.sentViaApi || media.simulated;
+        }
+        // Respuesta con botones (acción que el propio dueño acaba de pedir).
+        let sentButtons = false;
+        if (!sentMedia && result?.replyText && result?.replyButtons?.length) {
+          const interactive = await sendInteractiveButtons({
+            toPhone: fromPhone,
+            body: result.replyText,
+            buttons: result.replyButtons,
+          });
+          sentButtons = interactive.sentViaApi || interactive.simulated;
+        }
+        // Si la imagen o los botones fallan, al menos llega el texto.
+        if (!sentMedia && !sentButtons && result?.replyText) {
           await sendTextMessage({
             toPhone: fromPhone,
             body: result.replyText,
