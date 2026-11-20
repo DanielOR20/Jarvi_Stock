@@ -4,10 +4,11 @@ import { env, isAppSecretConfigured, isWhatsappConfigured } from '../config/env.
 import {
   getOrCreateConversation,
   insertInboundMessage,
+  findTenantByPhoneNumberId,
   normalizePhone,
-  resolveTenantByPhoneNumberId,
 } from '../config/db.js';
 import { processMessage } from '../services/agentRouter.js';
+import { resolveRoute } from '../services/messageRouter.js';
 import { sendMediaMessage, sendTextMessage } from '../services/whatsappOutbound.js';
 
 const router = express.Router();
@@ -58,7 +59,13 @@ async function processWebhookPayloadAsync(body) {
     for (const change of changes) {
       const value = change?.value;
       const phoneNumberId = value?.metadata?.phone_number_id || null;
-      const tenant = await resolveTenantByPhoneNumberId(phoneNumberId);
+      // Un número propio de un negocio va directo a ese negocio. El número
+      // compartido (WHATSAPP_PHONE_NUMBER_ID) pasa por el enrutador.
+      const numberTenant = await findTenantByPhoneNumberId(phoneNumberId);
+      const dedicatedTenant =
+        numberTenant && String(phoneNumberId) !== env.whatsapp.phoneNumberId
+          ? numberTenant
+          : null;
       const messages = Array.isArray(value?.messages) ? value.messages : [];
 
       for (const msg of messages) {
@@ -85,8 +92,16 @@ async function processWebhookPayloadAsync(body) {
             '';
         }
 
-        const conv = await getOrCreateConversation(tenant.id, fromPhone, 'client');
-        const { inserted } = await insertInboundMessage(tenant.id, {
+        const route = dedicatedTenant
+          ? null
+          : await resolveRoute({ fromPhone, text });
+        const storeTenantId = route ? route.tenantId : dedicatedTenant.id;
+        const storeMode =
+          route && ['owner', 'client', 'onboarding'].includes(route.mode)
+            ? route.mode
+            : 'client';
+        const conv = await getOrCreateConversation(storeTenantId, fromPhone, storeMode);
+        const { inserted } = await insertInboundMessage(storeTenantId, {
           conversation_id: conv.id,
           wa_message_id: waMessageId,
           sender_phone: fromPhone,
@@ -102,7 +117,8 @@ async function processWebhookPayloadAsync(body) {
         }
 
         const result = await processMessage({
-          tenantId: tenant.id,
+          tenantId: dedicatedTenant ? dedicatedTenant.id : null,
+          route,
           fromPhone,
           messageId: waMessageId,
           text,

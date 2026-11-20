@@ -115,6 +115,100 @@ export async function resolveTenantByPhoneNumberId(phoneNumberId) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Búsquedas entre negocios. Solo las usa el enrutador del número compartido
+// para decidir a qué negocio va un mensaje; son de solo lectura y no exponen
+// datos de catálogo, pedidos ni costos.
+// ---------------------------------------------------------------------------
+
+// Devuelve el negocio cuyo número propio es phoneNumberId, sin caer al negocio
+// por defecto (a diferencia de resolveTenantByPhoneNumberId).
+export async function findTenantByPhoneNumberId(phoneNumberId) {
+  if (!phoneNumberId) return null;
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      'SELECT * FROM tenants WHERE wa_phone_number_id = $1 LIMIT 1',
+      [String(phoneNumberId)]
+    );
+    return rows[0] || null;
+  }
+  return mem.tenants.find((t) => t.wa_phone_number_id === String(phoneNumberId)) || null;
+}
+
+export async function findAgentByCode(code) {
+  const wanted = String(code || '').trim().toUpperCase();
+  if (!wanted) return null;
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      'SELECT * FROM agents WHERE UPPER(activation_code) = $1 AND tenant_id <> $2 LIMIT 1',
+      [wanted, FACTORY_TENANT_ID]
+    );
+    return rows[0] || null;
+  }
+  return (
+    mem.agents.find(
+      (a) =>
+        a.tenant_id !== FACTORY_TENANT_ID &&
+        String(a.activation_code || '').toUpperCase() === wanted
+    ) || null
+  );
+}
+
+// Negocios de los que este teléfono es dueño, el más reciente primero.
+export async function findOwnedTenants(phone) {
+  const digits = normalizePhone(phone);
+  if (!digits) return [];
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `SELECT t.* FROM tenants t
+       JOIN users u ON u.tenant_id = t.id
+       WHERE u.phone = $1 AND u.role = 'owner' AND t.id <> $2
+       ORDER BY t.created_at DESC`,
+      [digits, FACTORY_TENANT_ID]
+    );
+    return rows;
+  }
+  const ownedIds = new Set(
+    mem.users
+      .filter((u) => u.role === 'owner' && normalizePhone(u.phone) === digits)
+      .map((u) => u.tenant_id)
+  );
+  return mem.tenants
+    .filter((t) => t.id !== FACTORY_TENANT_ID && ownedIds.has(t.id))
+    .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)));
+}
+
+// Conversación más reciente de este teléfono con un agente (dueño o cliente)
+// dentro de la ventana indicada. Excluye las entrevistas de la fábrica.
+export async function findLatestAgentConversation(phone, withinMinutes) {
+  const digits = normalizePhone(phone);
+  if (!digits) return null;
+  const since = new Date(Date.now() - withinMinutes * 60 * 1000);
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `SELECT * FROM conversations
+       WHERE participant_phone = $1 AND tenant_id <> $2
+         AND channel_mode IN ('owner', 'client') AND last_message_at >= $3
+       ORDER BY last_message_at DESC
+       LIMIT 1`,
+      [digits, FACTORY_TENANT_ID, since.toISOString()]
+    );
+    return rows[0] || null;
+  }
+  return (
+    mem.conversations
+      .filter(
+        (c) =>
+          c.participant_phone === digits &&
+          c.tenant_id !== FACTORY_TENANT_ID &&
+          (c.channel_mode === 'owner' || c.channel_mode === 'client') &&
+          new Date(c.last_message_at) >= since
+      )
+      .sort((a, b) => String(b.last_message_at).localeCompare(String(a.last_message_at)))[0] ||
+    null
+  );
+}
+
 export async function findUserByPhone(tenantId, phone) {
   const digits = normalizePhone(phone);
   if (!digits) return null;

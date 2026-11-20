@@ -19,6 +19,7 @@ import {
   normalizePhone,
   updateConversation,
 } from '../config/db.js';
+import { resolveRoute, stripAgentCode } from './messageRouter.js';
 
 function normalizeText(value) {
   return String(value || '')
@@ -559,62 +560,115 @@ async function handleClientMode(tenant, fromPhone, text) {
   };
 }
 
+// Rutas del simulador del CRM: el negocio viene fijado por el panel.
+async function resolveLegacyRoute(tenantId, fromPhone, text, forceMode) {
+  const normalized = normalizeText(text).trim();
+  const inProgress = await findActiveOnboardingConversation(FACTORY_TENANT_ID, fromPhone);
+  if (normalized.startsWith('#onboarding') || normalized.startsWith('#activar')) {
+    return { tenantId: FACTORY_TENANT_ID, mode: 'onboarding', reason: 'factory_command' };
+  }
+  if (inProgress || forceMode === 'onboarding') {
+    return {
+      tenantId: FACTORY_TENANT_ID,
+      mode: 'onboarding',
+      reason: inProgress ? 'onboarding_in_progress' : 'factory_command',
+    };
+  }
+  if (forceMode) return { tenantId, mode: forceMode, reason: 'forced' };
+  const user = await findUserByPhone(tenantId, fromPhone);
+  return { tenantId, mode: user?.role === 'owner' ? 'owner' : 'client', reason: 'simulator' };
+}
+
+/**
+ * Procesa un mensaje entrante.
+ * - Sin tenantId (número compartido): decide el negocio con resolveRoute().
+ * - Con tenantId (simulador del panel o número propio del negocio): usa ese negocio.
+ * - `route` permite pasar una ruta ya calculada (el webhook la calcula antes
+ *   de guardar el mensaje entrante).
+ */
 export async function processMessage({
-  tenantId,
+  tenantId = null,
   fromPhone,
   messageId = null,
   text = '',
   mediaUrl = null,
   timestamp = new Date().toISOString(),
   forceMode = null,
+  route = null,
 }) {
-  const tenant = await getTenant(tenantId);
+  const resolved =
+    route ||
+    (tenantId
+      ? await resolveLegacyRoute(tenantId, fromPhone, text, forceMode)
+      : await resolveRoute({ fromPhone, text }));
+
+  const mode = resolved.mode;
+  const tenant = await getTenant(resolved.tenantId);
   if (!tenant) {
     throw new Error('Tenant no encontrado.');
   }
 
-  const normalized = normalizeText(text).trim();
-  // Las entrevistas viven en el negocio de la fábrica, no en el del número que recibe.
-  const activeOnboarding = await findActiveOnboardingConversation(
-    FACTORY_TENANT_ID,
-    fromPhone
-  );
-  const startsOnboarding =
-    normalized.startsWith('#onboarding') || normalized.startsWith('#activar');
-
-  let mode = forceMode;
-  if (!mode) {
-    if (activeOnboarding || startsOnboarding) {
-      mode = 'onboarding';
-    } else {
-      const user = await findUserByPhone(tenant.id, fromPhone);
-      mode = user?.role === 'owner' ? 'owner' : 'client';
+  // Si el cliente llegó con un código, abandona cualquier entrevista a medias.
+  if (resolved.code) {
+    const pending = await findActiveOnboardingConversation(FACTORY_TENANT_ID, fromPhone);
+    if (pending) {
+      await updateConversation(FACTORY_TENANT_ID, pending.id, { onboarding_step: null });
     }
   }
 
-  const convTenantId = mode === 'onboarding' ? FACTORY_TENANT_ID : tenant.id;
-  const agents = mode === 'onboarding' ? [] : await listAgents(tenant.id);
-  const selectedAgent = agents.find((a) =>
-    mode === 'owner' ? a.type === 'personal' : a.type === 'attention'
-  );
-
-  const conversation = await getOrCreateConversation(
-    convTenantId,
-    fromPhone,
-    mode,
-    selectedAgent?.id || null
-  );
-
-  let result;
-  if (mode === 'onboarding') {
-    result = await handleOnboardingStep(fromPhone, text, activeOnboarding);
-  } else if (mode === 'owner') {
-    result = await handleOwnerMode(tenant, fromPhone, text, mediaUrl);
-  } else {
-    result = await handleClientMode(tenant, fromPhone, text);
+  const convMode = ['owner', 'client', 'onboarding'].includes(mode) ? mode : 'client';
+  let selectedAgentId = resolved.agentId || null;
+  if (!selectedAgentId && (mode === 'owner' || mode === 'client')) {
+    const agents = await listAgents(tenant.id);
+    selectedAgentId =
+      agents.find((a) => (mode === 'owner' ? a.type === 'personal' : a.type === 'attention'))
+        ?.id || null;
   }
 
-  await insertOutboundMessage(convTenantId, {
+  // Solo se continúa una entrevista si la ruta lo dice; en otro caso empieza de
+  // cero (aunque el webhook ya haya creado la fila de la conversación).
+  const activeOnboarding =
+    mode === 'onboarding' && resolved.reason === 'onboarding_in_progress'
+      ? await findActiveOnboardingConversation(FACTORY_TENANT_ID, fromPhone)
+      : null;
+
+  const conversation = await getOrCreateConversation(
+    tenant.id,
+    fromPhone,
+    convMode,
+    selectedAgentId
+  );
+
+  // El código solo sirve para elegir el agente; no se interpreta como consulta.
+  const body = resolved.code ? stripAgentCode(text) : text;
+
+  let result;
+  if (mode === 'unavailable') {
+    result = {
+      replyText: 'Este negocio no está atendiendo por WhatsApp en este momento. Intenta más tarde.',
+      replyMediaUrl: null,
+      createdPendingAction: null,
+      mode,
+    };
+  } else if (mode === 'onboarding') {
+    result = await handleOnboardingStep(fromPhone, text, activeOnboarding);
+  } else if (resolved.code && !body && !mediaUrl) {
+    result = {
+      replyText:
+        mode === 'owner'
+          ? `Hola, soy ${tenant.activation_name || 'Jarvis'}, tu asistente de ${tenant.name}. ¿Qué necesitas?`
+          : `¡Hola! Bienvenido a ${tenant.name}. ¿Qué producto buscas?`,
+      replyMediaUrl: null,
+      createdPendingAction: null,
+      mode,
+    };
+  } else if (mode === 'owner') {
+    result = await handleOwnerMode(tenant, fromPhone, body, mediaUrl);
+  } else {
+    result = await handleClientMode(tenant, fromPhone, body);
+  }
+
+  await insertOutboundMessage(tenant.id, {
     conversation_id: conversation.id,
     wa_message_id: messageId ? `${messageId}:reply` : null,
     sender_phone: 'system',
@@ -626,5 +680,6 @@ export async function processMessage({
     ...result,
     timestamp,
     tenantId: tenant.id,
+    route: { mode, reason: resolved.reason },
   };
 }
