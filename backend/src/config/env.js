@@ -38,7 +38,12 @@ export const env = {
     graphApiVersion: process.env.WHATSAPP_GRAPH_API_VERSION || 'v21.0',
     wabaId: (process.env.WHATSAPP_WABA_ID || '').trim(),
     dryRun: String(process.env.WHATSAPP_DRY_RUN || 'false').toLowerCase() === 'true',
+    // Número visible del número compartido (solo dígitos, con código de país),
+    // usado para armar los enlaces wa.me de cada agente.
+    displayPhone: (process.env.WHATSAPP_DISPLAY_PHONE || '').replace(/\D/g, ''),
   },
+  // URL pública del servicio (Render). Meta descarga desde aquí las imágenes QR.
+  publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, ''),
 };
 
 export function isWhatsappConfigured() {

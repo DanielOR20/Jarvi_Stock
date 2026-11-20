@@ -20,6 +20,7 @@ import {
   updateConversation,
 } from '../config/db.js';
 import { resolveRoute, stripAgentCode } from './messageRouter.js';
+import { buildAgentQrUrl, buildAgentWaLink } from './shareLinks.js';
 
 function normalizeText(value) {
   return String(value || '')
@@ -241,11 +242,26 @@ async function handleOnboardingStep(fromPhone, text, existingConv) {
   await updateConversation(tenantId, conv.id, { onboarding_step: null, context_json: ctx });
 
   const publicCode = deployed.agents?.attention?.activation_code;
+  const shareLink = buildAgentWaLink(publicCode);
+  const qrUrl = buildAgentQrUrl(publicCode);
+
+  // El código privado no se manda por chat: el dueño ya se reconoce por su número.
+  const lines = [
+    `¡Listo! Creamos tu negocio "${ctx.businessName}" con dos agentes:`,
+    `1) Tu asistente privado "${ctx.activationName}": solo te responde a ti. Escríbele desde este número mencionando "${ctx.activationName}".`,
+    `2) Tu agente de atención: responde a tus clientes sin mostrar costos ni proveedores.`,
+    '',
+    shareLink
+      ? `Comparte este enlace con tus clientes:\n${shareLink}`
+      : `Tus clientes deben escribir este código a nuestro número: ${publicCode}`,
+  ];
+  if (qrUrl) lines.push('', 'Este QR lleva al mismo enlace: imprímelo o ponlo en tus redes.');
+  lines.push('', `Tope mensual: ${deployed.usageCaps.monthlyMsgLimit} mensajes.`);
+
   return {
-    ...onboardingReply(
-      `¡Listo! Creamos tu negocio "${ctx.businessName}" con dos agentes:\n1) Asistente privado "${ctx.activationName}" (solo te responde a ti). Código: ${deployed.activationCode}\n2) Agente público de atención al cliente (oculta costos y proveedores). Código para tus clientes: ${publicCode}\nTope mensual: ${deployed.usageCaps.monthlyMsgLimit} mensajes.`
-    ),
-    onboardingResult: deployed,
+    ...onboardingReply(lines.join('\n')),
+    replyMediaUrl: qrUrl,
+    onboardingResult: { ...deployed, publicCode, shareLink, qrUrl },
   };
 }
 

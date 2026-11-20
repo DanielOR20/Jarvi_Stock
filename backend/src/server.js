@@ -4,6 +4,7 @@ import { env, isWhatsappConfigured } from './config/env.js';
 import { getDbMode, initDb } from './config/db.js';
 import webhookRoutes from './routes/webhook.routes.js';
 import crmRoutes from './routes/crm.routes.js';
+import publicRoutes from './routes/public.routes.js';
 
 const app = express();
 
@@ -45,6 +46,7 @@ app.get('/api/health', (_req, res) => {
 });
 
 app.use('/api/webhook', webhookRoutes);
+app.use('/api/public', publicRoutes);
 app.use('/api', crmRoutes);
 
 app.use((req, res) => {

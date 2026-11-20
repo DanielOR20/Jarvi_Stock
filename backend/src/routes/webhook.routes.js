@@ -128,13 +128,17 @@ async function processWebhookPayloadAsync(body) {
             : new Date().toISOString(),
         });
 
+        let sentMedia = false;
         if (result?.replyMediaUrl) {
-          await sendMediaMessage({
+          const media = await sendMediaMessage({
             toPhone: fromPhone,
             mediaUrl: result.replyMediaUrl,
             caption: result.replyText || '',
           });
-        } else if (result?.replyText) {
+          sentMedia = media.sentViaApi || media.simulated;
+        }
+        // Si la imagen falla (p. ej. Meta no pudo descargarla), al menos llega el texto.
+        if (!sentMedia && result?.replyText) {
           await sendTextMessage({
             toPhone: fromPhone,
             body: result.replyText,
