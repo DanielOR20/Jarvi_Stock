@@ -25,10 +25,13 @@ export const env = {
   internalEngineKey: process.env.INTERNAL_ENGINE_KEY || 'jarvi-stock-dev-engine-key',
   mediaPublicBaseUrl: process.env.MEDIA_PUBLIC_BASE_URL || 'http://localhost:4000/uploads',
   pendingActionTtlHours: Number(process.env.PENDING_ACTION_TTL_HOURS || 24),
+  // Modelo que interpreta los mensajes del dueño. Sin clave, el sistema usa
+  // las reglas por palabras clave de siempre.
   llm: {
-    provider: process.env.LLM_PROVIDER || 'gemini',
-    apiKey: process.env.LLM_API_KEY || '',
-    model: process.env.LLM_MODEL || 'gemini-2.5-flash',
+    provider: (process.env.LLM_PROVIDER || 'anthropic').trim().toLowerCase(),
+    apiKey: (process.env.ANTHROPIC_API_KEY || process.env.LLM_API_KEY || '').trim(),
+    model: (process.env.LLM_MODEL || 'claude-opus-5-5').trim(),
+    timeoutMs: Number(process.env.LLM_TIMEOUT_MS || 20000),
   },
   whatsapp: {
     verifyToken: process.env.WHATSAPP_VERIFY_TOKEN || 'jarvi_stock_verify_token_local',
