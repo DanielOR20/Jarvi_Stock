@@ -622,6 +622,12 @@ async function handleClientMode(tenant, fromPhone, text) {
         agentName: 'Agente Atención al Cliente',
         supplierId: chosen.supplier_id,
         supplierName: chosen.supplier_name,
+        // Lo que recibe el proveedor al aprobar. Sin datos del cliente.
+        supplierMessage: `Hola ${chosen.supplier_name}, le escribe ${tenant.name}. Quisiéramos pedirle ${quantity}x "${chosen.name}"${
+          chosen.sku ? ` (SKU ${chosen.sku})` : ''
+        } a ${formatColones(chosen.cost_price)} c/u. ¿Lo tiene disponible para recoger hoy${
+          chosen.supplier?.location ? ` en ${chosen.supplier.location}` : ''
+        }? Gracias.`,
         nextStage: 'pedido_proveedor',
         impactSummary: `Costo ${formatColones(totalCost)} · Venta ${formatColones(
           totalSale
@@ -724,6 +730,9 @@ export async function processMessage({
   timestamp = new Date().toISOString(),
   forceMode = null,
   route = null,
+  // El simulador del panel lo pone en false: probar no debe mandar avisos
+  // reales por WhatsApp a los dueños.
+  notifyOwners = true,
 }) {
   const resolved =
     route ||
@@ -802,6 +811,8 @@ export async function processMessage({
       // El propio dueño pidió la acción: su respuesta lleva los botones.
       result.replyButtons = buildDecisionButtons(result.createdPendingAction.id);
       result.replyText += '\n\nPuedes decidir aquí con los botones o desde el panel.';
+    } else if (!notifyOwners) {
+      result.ownerNotifications = { skipped: 'simulator' };
     } else {
       // Nació de un cliente: se avisa a los dueños. Si el aviso falla, el
       // cliente igual recibe su respuesta y la acción queda en el panel.

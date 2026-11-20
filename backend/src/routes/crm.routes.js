@@ -370,6 +370,7 @@ router.post('/engine/process-message', async (req, res, next) => {
       mediaUrl: mediaUrl || null,
       timestamp,
       forceMode: forceMode || null,
+      notifyOwners: false,
     });
     res.json(result);
   } catch (err) {

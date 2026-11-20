@@ -123,9 +123,11 @@ export async function decidePendingAction({
       });
     }
 
+    // preview_text es el resumen interno para el dueño; al proveedor se le envía
+    // el mensaje redactado para él cuando existe.
     whatsappDelivery = await sendTextMessage({
       toPhone: action.target_phone,
-      body: action.preview_text,
+      body: action.payload_json?.supplierMessage || action.preview_text,
     });
 
     await addAuditLog(tenantId, {
