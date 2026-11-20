@@ -41,6 +41,9 @@ export const env = {
     // Número visible del número compartido (solo dígitos, con código de país),
     // usado para armar los enlaces wa.me de cada agente.
     displayPhone: (process.env.WHATSAPP_DISPLAY_PHONE || '').replace(/\D/g, ''),
+    // Solo para pruebas locales sin App Secret. Nunca tiene efecto en producción.
+    allowUnsigned:
+      String(process.env.WEBHOOK_ALLOW_UNSIGNED || 'false').toLowerCase() === 'true',
   },
   // URL pública del servicio (Render). Meta descarga desde aquí las imágenes QR.
   publicBaseUrl: (process.env.PUBLIC_BASE_URL || '').trim().replace(/\/+$/, ''),
@@ -56,4 +59,13 @@ export function isWhatsappConfigured() {
 
 export function isAppSecretConfigured() {
   return isRealValue(env.whatsapp.appSecret);
+}
+
+// Aceptar webhooks sin firma exige pedirlo explícitamente, no tener App Secret
+// y no estar en producción. Por defecto todo webhook debe venir firmado.
+// (Render no define NODE_ENV=production por sí solo, por eso no basta con mirarlo.)
+export function isUnsignedWebhookAllowed() {
+  return (
+    env.whatsapp.allowUnsigned && !isAppSecretConfigured() && env.nodeEnv !== 'production'
+  );
 }

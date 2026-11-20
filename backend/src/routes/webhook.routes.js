@@ -1,6 +1,11 @@
 import crypto from 'node:crypto';
 import express from 'express';
-import { env, isAppSecretConfigured, isWhatsappConfigured } from '../config/env.js';
+import {
+  env,
+  isAppSecretConfigured,
+  isUnsignedWebhookAllowed,
+  isWhatsappConfigured,
+} from '../config/env.js';
 import {
   getOrCreateConversation,
   insertInboundMessage,
@@ -15,8 +20,12 @@ const router = express.Router();
 
 function verifyMetaSignature(req) {
   const header = req.headers['x-hub-signature-256'];
-  if (!isAppSecretConfigured() && !header) {
+  if (isUnsignedWebhookAllowed() && !header) {
     return true;
+  }
+  if (!isAppSecretConfigured()) {
+    console.error('[webhook] WHATSAPP_APP_SECRET no configurado: se rechaza la petición.');
+    return false;
   }
   if (!header || !req.rawBody) {
     return false;

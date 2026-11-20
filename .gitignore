@@ -1,0 +1,18 @@
+# Dependencias (se instalan con npm install / npm ci)
+node_modules/
+
+# Builds (Render los genera en cada deploy)
+dist/
+build/
+coverage/
+
+# Secretos: nunca subir. Solo se versiona la plantilla .env.example
+.env
+.env.*
+!.env.example
+
+# Registros y archivos del sistema
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
