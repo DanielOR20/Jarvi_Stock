@@ -9,7 +9,12 @@ import {
 } from '../config/db.js';
 import { processMessage } from '../services/agentRouter.js';
 import { resolveRoute } from '../services/messageRouter.js';
-import { sendMediaMessage, sendTextMessage } from '../services/whatsappOutbound.js';
+import { handleDecisionButton } from '../services/pendingActions.js';
+import {
+  sendInteractiveButtons,
+  sendMediaMessage,
+  sendTextMessage,
+} from '../services/whatsappOutbound.js';
 
 const router = express.Router();
 
@@ -90,6 +95,24 @@ async function processWebhookPayloadAsync(body) {
             msg?.interactive?.button_reply?.title ||
             msg?.interactive?.list_reply?.title ||
             '';
+          // Botón Aprobar/Rechazar de una pending action: se atiende ANTES del
+          // enrutador normal. El negocio sale de la acción, no del mensaje.
+          const decision = await handleDecisionButton({
+            fromPhone,
+            buttonId: msg?.interactive?.button_reply?.id,
+            waMessageId,
+            buttonTitle: text,
+            rawPayload: msg,
+          });
+          if (decision) {
+            if (decision.duplicate) {
+              console.log(`[webhook] Duplicado descartado wa_message_id=${waMessageId}`);
+            }
+            for (const body of decision.replies) {
+              await sendTextMessage({ toPhone: fromPhone, body });
+            }
+            continue;
+          }
         }
 
         const route = dedicatedTenant
@@ -137,8 +160,18 @@ async function processWebhookPayloadAsync(body) {
           });
           sentMedia = media.sentViaApi || media.simulated;
         }
-        // Si la imagen falla (p. ej. Meta no pudo descargarla), al menos llega el texto.
-        if (!sentMedia && result?.replyText) {
+        // Respuesta con botones (acción que el propio dueño acaba de pedir).
+        let sentButtons = false;
+        if (!sentMedia && result?.replyText && result?.replyButtons?.length) {
+          const interactive = await sendInteractiveButtons({
+            toPhone: fromPhone,
+            body: result.replyText,
+            buttons: result.replyButtons,
+          });
+          sentButtons = interactive.sentViaApi || interactive.simulated;
+        }
+        // Si la imagen o los botones fallan, al menos llega el texto.
+        if (!sentMedia && !sentButtons && result?.replyText) {
           await sendTextMessage({
             toPhone: fromPhone,
             body: result.replyText,

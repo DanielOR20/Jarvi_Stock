@@ -1211,6 +1211,40 @@ export async function getPendingActionById(tenantId, actionId) {
   );
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Busca una acción solo por su id, sin conocer el negocio (lo usa el botón de
+// WhatsApp, que solo trae el id). Es la única consulta sin filtro de tenant_id:
+// quien la llama DEBE comprobar enseguida que el teléfono es dueño del negocio
+// de la acción (action.tenant_id) antes de mostrar o ejecutar nada.
+export async function findPendingActionForDecision(actionId) {
+  const id = String(actionId || '');
+  if (!UUID_RE.test(id)) return null;
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      'SELECT * FROM pending_actions WHERE id = $1 LIMIT 1',
+      [id]
+    );
+    return rows[0] || null;
+  }
+  return mem.pending_actions.find((pa) => pa.id === id) || null;
+}
+
+// Teléfonos de los dueños (rol owner) de un negocio.
+export async function listOwnerPhones(tenantId) {
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `SELECT phone FROM users WHERE tenant_id = $1 AND role = 'owner' ORDER BY created_at`,
+      [tenantId]
+    );
+    return rows.map((r) => normalizePhone(r.phone)).filter(Boolean);
+  }
+  return mem.users
+    .filter((u) => u.tenant_id === tenantId && u.role === 'owner')
+    .map((u) => normalizePhone(u.phone))
+    .filter(Boolean);
+}
+
 export async function markPendingActionDecision(tenantId, actionId, decision) {
   const nowIso = new Date().toISOString();
   if (dbMode === 'postgres') {

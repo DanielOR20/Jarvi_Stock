@@ -8,7 +8,6 @@ import {
   deployOnboardingAgents,
   getDailyPickupRoute,
   getDashboardSummary,
-  getPendingActionById,
   getTenant,
   getTenants,
   listAgents,
@@ -16,7 +15,6 @@ import {
   listPendingActions,
   listProducts,
   listSuppliers,
-  markPendingActionDecision,
   toggleAgent,
   updateOrder,
   updateProduct,
@@ -24,7 +22,7 @@ import {
 } from '../config/db.js';
 import { DEFAULT_TENANT_ID } from '../db/seed.js';
 import { processMessage } from '../services/agentRouter.js';
-import { sendTextMessage } from '../services/whatsappOutbound.js';
+import { decidePendingAction } from '../services/pendingActions.js';
 
 const router = express.Router();
 
@@ -259,85 +257,31 @@ router.post('/pending-actions', async (req, res, next) => {
   }
 });
 
+// La ejecución vive en services/pendingActions.js y la comparte el botón de WhatsApp.
+function sendDecisionError(res, outcome) {
+  if (outcome.code === 'NOT_FOUND') {
+    return res.status(404).json({
+      error: { code: 'NOT_FOUND', message: 'Accion pendiente no encontrada.' },
+    });
+  }
+  return res.status(409).json({
+    error: {
+      code: 'ALREADY_DECIDED',
+      message: `La accion ya se encuentra en estado "${outcome.action?.status}".`,
+    },
+  });
+}
+
 router.post('/pending-actions/:id/approve', async (req, res, next) => {
   try {
     const tenant = await getTenant(resolveTenantId(req));
-    const existing = await getPendingActionById(tenant.id, req.params.id);
-    if (!existing) {
-      return res.status(404).json({
-        error: { code: 'NOT_FOUND', message: 'Accion pendiente no encontrada.' },
-      });
-    }
-    if (existing.status !== 'pending') {
-      return res.status(409).json({
-        error: {
-          code: 'ALREADY_DECIDED',
-          message: `La accion ya se encuentra en estado "${existing.status}".`,
-        },
-      });
-    }
-
-    const action = await markPendingActionDecision(tenant.id, req.params.id, 'approved');
-    let createdProduct = null;
-    let updatedOrder = null;
-    let whatsappDelivery = null;
-
-    if (action.action_type === 'create_product' && action.payload_json?.product) {
-      const prodPayload = action.payload_json.product;
-      let supplierId = prodPayload.supplier_id || null;
-      if (!supplierId && action.payload_json?.supplier) {
-        const sup = await createSupplier(tenant.id, action.payload_json.supplier);
-        supplierId = sup.id;
-      }
-      if (!supplierId) {
-        const allSups = await listSuppliers(tenant.id);
-        supplierId = allSups[0]?.id;
-      }
-      createdProduct = await createProduct(tenant.id, {
-        ...prodPayload,
-        supplier_id: supplierId,
-      });
-      await addAuditLog(tenant.id, {
-        actor: 'owner:hitl',
-        action: 'pending_action.approved',
-        result: `Aprobó y publicó "${createdProduct.name}" en el catálogo.`,
-      });
-    } else if (
-      action.action_type === 'purchase_order' ||
-      action.action_type === 'quote_approval' ||
-      action.action_type === 'supplier_stock_check'
-    ) {
-      if (action.order_id) {
-        const nextStage =
-          action.payload_json?.nextStage ||
-          (action.action_type === 'purchase_order' ? 'pedido_proveedor' : 'por_confirmar');
-        updatedOrder = await updateOrder(tenant.id, action.order_id, {
-          status: nextStage,
-          pickup_notes:
-            nextStage === 'pedido_proveedor'
-              ? 'OC enviada · Recoger hoy'
-              : 'Cotización enviada al cliente',
-        });
-      }
-
-      whatsappDelivery = await sendTextMessage({
-        toPhone: action.target_phone,
-        body: action.preview_text,
-      });
-
-      await addAuditLog(tenant.id, {
-        actor: 'owner:hitl',
-        action: 'pending_action.approved',
-        result: `Ejecutó ${action.action_type} hacia ${action.target_phone}.`,
-      });
-    } else {
-      await addAuditLog(tenant.id, {
-        actor: 'owner:hitl',
-        action: 'pending_action.approved',
-        result: `Atendió traspaso humano: ${action.payload_json?.title || action.id}`,
-      });
-    }
-
+    const outcome = await decidePendingAction({
+      tenantId: tenant.id,
+      actionId: req.params.id,
+      decision: 'approve',
+    });
+    if (!outcome.ok) return sendDecisionError(res, outcome);
+    const { action, createdProduct, updatedOrder, whatsappDelivery } = outcome;
     res.json({ action, createdProduct, updatedOrder, whatsappDelivery });
   } catch (err) {
     next(err);
@@ -347,28 +291,13 @@ router.post('/pending-actions/:id/approve', async (req, res, next) => {
 router.post('/pending-actions/:id/reject', async (req, res, next) => {
   try {
     const tenant = await getTenant(resolveTenantId(req));
-    const existing = await getPendingActionById(tenant.id, req.params.id);
-    if (!existing) {
-      return res.status(404).json({
-        error: { code: 'NOT_FOUND', message: 'Accion pendiente no encontrada.' },
-      });
-    }
-    if (existing.status !== 'pending') {
-      return res.status(409).json({
-        error: {
-          code: 'ALREADY_DECIDED',
-          message: `La accion ya se encuentra en estado "${existing.status}".`,
-        },
-      });
-    }
-
-    const action = await markPendingActionDecision(tenant.id, req.params.id, 'rejected');
-    await addAuditLog(tenant.id, {
-      actor: 'owner:hitl',
-      action: 'pending_action.rejected',
-      result: `Descartó acción: ${action.payload_json?.title || action.action_type}.`,
+    const outcome = await decidePendingAction({
+      tenantId: tenant.id,
+      actionId: req.params.id,
+      decision: 'reject',
     });
-    res.json({ action });
+    if (!outcome.ok) return sendDecisionError(res, outcome);
+    res.json({ action: outcome.action });
   } catch (err) {
     next(err);
   }

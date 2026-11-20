@@ -21,16 +21,18 @@ import {
 } from '../config/db.js';
 import { resolveRoute, stripAgentCode } from './messageRouter.js';
 import { buildAgentQrUrl, buildAgentWaLink } from './shareLinks.js';
+import {
+  buildDecisionButtons,
+  buildPendingActionSummary,
+  formatColones,
+  notifyOwnersOfPendingAction,
+} from './pendingActions.js';
 
 function normalizeText(value) {
   return String(value || '')
     .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '');
-}
-
-function formatColones(value) {
-  return `₡${Math.round(Number(value) || 0).toLocaleString('en-US')}`;
 }
 
 function findMatchingProducts(query, productList) {
@@ -265,6 +267,35 @@ async function handleOnboardingStep(fromPhone, text, existingConv) {
   };
 }
 
+// "sí", "aprobar", "rechazo"... sin decir cuál acción. Nunca se ejecuta nada
+// con un texto así: la confirmación se liga a una acción concreta (botón).
+const DECISION_WORDS = new Set([
+  'si', 'aprobar', 'apruebo', 'aprueba', 'aprobado', 'aprobada', 'confirmar', 'confirmo',
+  'confirma', 'ok', 'okay', 'dale', 'listo', 'rechazar', 'rechazo', 'rechaza', 'no',
+  'cancelar', 'cancela', 'cancelo',
+]);
+const DECISION_FILLER = new Set([
+  'la', 'el', 'lo', 'eso', 'esa', 'esta', 'por', 'favor', 'accion', 'pedido', 'orden',
+]);
+
+function isBareDecisionText(text, wakeWord) {
+  const wake = normalizeText(wakeWord).trim();
+  const tokens = normalizeText(text)
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter((t) => t && t !== wake);
+  return (
+    tokens.length > 0 &&
+    tokens.length <= 5 &&
+    tokens.some((t) => DECISION_WORDS.has(t)) &&
+    tokens.every((t) => DECISION_WORDS.has(t) || DECISION_FILLER.has(t))
+  );
+}
+
+function ownerReply(replyText, extra = {}) {
+  return { replyText, replyMediaUrl: null, createdPendingAction: null, mode: 'owner', ...extra };
+}
+
 async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
   const wakeWord = tenant.activation_name || 'Jarvis';
   const defaultMargin = Number(tenant.default_margin || 40);
@@ -273,6 +304,31 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
     listSuppliers(tenant.id),
     listPendingActions(tenant.id, 'pending'),
   ]);
+
+  if (!mediaUrl && isBareDecisionText(text, wakeWord)) {
+    if (pending.length === 0) {
+      return ownerReply('No tienes acciones pendientes por confirmar.');
+    }
+    if (pending.length === 1) {
+      // Se vuelve a preguntar con los botones de ESA acción; no se ejecuta nada.
+      const only = pending[0];
+      return ownerReply(
+        `Para confirmar usa los botones de la acción:\n\n${buildPendingActionSummary(only, {
+          tenantName: tenant.name,
+        })}`,
+        { replyButtons: buildDecisionButtons(only.id) }
+      );
+    }
+    const list = pending
+      .slice(0, 5)
+      .map((pa, i) => `${i + 1}. ${pa.payload_json?.title || pa.action_type}`)
+      .join('\n');
+    return ownerReply(
+      `Tienes ${pending.length} acciones pendientes y no sé a cuál te refieres, así que no ejecuté nada:\n${list}${
+        pending.length > 5 ? '\n…' : ''
+      }\n\nUsa el botón Aprobar o Rechazar del aviso de cada una (o el panel).`
+    );
+  }
 
   const parsedSave = parseOwnerSaveCommand(text, defaultMargin);
   if (parsedSave || mediaUrl) {
@@ -682,6 +738,27 @@ export async function processMessage({
     result = await handleOwnerMode(tenant, fromPhone, body, mediaUrl);
   } else {
     result = await handleClientMode(tenant, fromPhone, body);
+  }
+
+  if (result.createdPendingAction) {
+    if (mode === 'owner') {
+      // El propio dueño pidió la acción: su respuesta lleva los botones.
+      result.replyButtons = buildDecisionButtons(result.createdPendingAction.id);
+      result.replyText += '\n\nPuedes decidir aquí con los botones o desde el panel.';
+    } else {
+      // Nació de un cliente: se avisa a los dueños. Si el aviso falla, el
+      // cliente igual recibe su respuesta y la acción queda en el panel.
+      try {
+        result.ownerNotifications = await notifyOwnersOfPendingAction({
+          tenant,
+          action: result.createdPendingAction,
+          customerPhone: fromPhone,
+          order: result.createdOrder || null,
+        });
+      } catch (err) {
+        console.error('[agentRouter] Error avisando al dueño:', err);
+      }
+    }
   }
 
   await insertOutboundMessage(tenant.id, {
