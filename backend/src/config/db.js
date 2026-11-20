@@ -1,7 +1,14 @@
 import crypto from 'node:crypto';
 import pg from 'pg';
 import { env } from './env.js';
-import { buildSeedData, DEFAULT_TENANT_ID, seedPostgres } from '../db/seed.js';
+import {
+  buildSeedData,
+  DEFAULT_TENANT_ID,
+  FACTORY_TENANT_ID,
+  seedPostgres,
+} from '../db/seed.js';
+
+export { FACTORY_TENANT_ID };
 
 let dbMode = 'memory';
 let pgPool = null;
@@ -67,11 +74,12 @@ export function getDbMode() {
 export async function getTenants() {
   if (dbMode === 'postgres') {
     const { rows } = await pgPool.query(
-      'SELECT * FROM tenants ORDER BY created_at ASC'
+      'SELECT * FROM tenants WHERE id <> $1 ORDER BY created_at ASC',
+      [FACTORY_TENANT_ID]
     );
     return rows;
   }
-  return [...mem.tenants];
+  return mem.tenants.filter((t) => t.id !== FACTORY_TENANT_ID);
 }
 
 export async function getTenant(tenantId = DEFAULT_TENANT_ID) {
@@ -602,6 +610,53 @@ export async function toggleAgent(tenantId, agentId) {
   return agent;
 }
 
+// Crea un negocio nuevo a partir de la entrevista de la fábrica. Cada
+// entrevista completada produce su propio tenant: nunca reutiliza uno existente.
+export async function createTenantFromOnboarding(payload) {
+  const {
+    businessName,
+    businessIndustry = 'Comercio sin inventario propio',
+    activationName = 'Jarvis',
+    defaultMargin = 40,
+    handoffRule = 'Escalar al dueño por WhatsApp y pausar respuestas automáticas',
+  } = payload;
+
+  const tenant = {
+    id: crypto.randomUUID(),
+    name: String(businessName || 'Negocio nuevo').slice(0, 140),
+    business_industry: String(businessIndustry).slice(0, 160),
+    activation_name: String(activationName || 'Jarvis').slice(0, 60),
+    default_margin: Number(defaultMargin),
+    handoff_rule: handoffRule,
+    wa_phone_number_id: null,
+    status: 'onboarding',
+    monthly_msg_limit: 1500,
+    created_at: new Date().toISOString(),
+  };
+
+  if (dbMode === 'postgres') {
+    const { rows } = await pgPool.query(
+      `INSERT INTO tenants (id, name, business_industry, activation_name, default_margin, handoff_rule, status, monthly_msg_limit)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+       RETURNING *`,
+      [
+        tenant.id,
+        tenant.name,
+        tenant.business_industry,
+        tenant.activation_name,
+        tenant.default_margin,
+        tenant.handoff_rule,
+        tenant.status,
+        tenant.monthly_msg_limit,
+      ]
+    );
+    return rows[0];
+  }
+
+  mem.tenants.push(tenant);
+  return tenant;
+}
+
 export async function deployOnboardingAgents(tenantId, payload) {
   const {
     businessName,
@@ -617,8 +672,8 @@ export async function deployOnboardingAgents(tenantId, payload) {
     .replace(/[^a-zA-Z0-9]/g, '')
     .slice(0, 4)
     .toUpperCase() || 'JARV';
-  const personalCode = `JRV-${codePrefix}-${Math.floor(1000 + Math.random() * 8999)}`;
-  const publicCode = `JRV-PUB-${Math.floor(1000 + Math.random() * 8999)}`;
+  const personalCode = `JRV-${codePrefix}-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
+  const publicCode = `JRV-PUB-${crypto.randomBytes(3).toString('hex').toUpperCase()}`;
 
   if (dbMode === 'postgres') {
     await pgPool.query(

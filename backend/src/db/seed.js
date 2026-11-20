@@ -6,6 +6,10 @@ import { env } from '../config/env.js';
 
 export const DEFAULT_TENANT_ID = '11111111-1111-4111-8111-111111111101';
 
+// Negocio interno de la plataforma: aloja las conversaciones de la fábrica
+// (entrevistas). No es un cliente y no aparece en el CRM.
+export const FACTORY_TENANT_ID = '00000000-0000-4000-8000-00000000fab1';
+
 export function buildSeedData() {
   const now = new Date();
   const expiresAt = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
@@ -33,6 +37,18 @@ export function buildSeedData() {
       wa_phone_number_id: null,
       status: 'active',
       monthly_msg_limit: 1500,
+      created_at: now.toISOString(),
+    },
+    {
+      id: FACTORY_TENANT_ID,
+      name: 'Fábrica de agentes (plataforma)',
+      business_industry: 'Plataforma',
+      activation_name: 'Fabrica',
+      default_margin: 0,
+      handoff_rule: 'No aplica',
+      wa_phone_number_id: null,
+      status: 'active',
+      monthly_msg_limit: 100000,
       created_at: now.toISOString(),
     },
   ];

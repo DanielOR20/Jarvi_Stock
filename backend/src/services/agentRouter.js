@@ -3,7 +3,9 @@ import {
   calculateMargin,
   createOrder,
   createPendingAction,
+  createTenantFromOnboarding,
   deployOnboardingAgents,
+  FACTORY_TENANT_ID,
   findActiveOnboardingConversation,
   findUserByPhone,
   getDailyPickupRoute,
@@ -170,24 +172,30 @@ function toPublicProduct(product) {
   };
 }
 
-async function handleOnboardingStep(tenant, fromPhone, text, existingConv) {
+// La entrevista vive en el negocio interno de la fábrica (FACTORY_TENANT_ID).
+// Al terminar crea un negocio NUEVO cuyo dueño es quien escribió (fromPhone):
+// el dueño nunca se escribe a mano, para que nadie pueda apropiarse de otro número.
+const ONBOARDING_TOTAL = 4;
+
+function onboardingReply(replyText) {
+  return { replyText, replyMediaUrl: null, createdPendingAction: null, mode: 'onboarding' };
+}
+
+async function handleOnboardingStep(fromPhone, text, existingConv) {
+  const tenantId = FACTORY_TENANT_ID;
   const conv =
-    existingConv || (await getOrCreateConversation(tenant.id, fromPhone, 'onboarding'));
+    existingConv || (await getOrCreateConversation(tenantId, fromPhone, 'onboarding'));
   const normalized = normalizeText(text).trim();
 
   if (!existingConv || normalized.includes('#onboarding') || normalized.includes('#activar')) {
-    await updateConversation(tenant.id, conv.id, {
+    await updateConversation(tenantId, conv.id, {
       channel_mode: 'onboarding',
       onboarding_step: 1,
       context_json: {},
     });
-    return {
-      replyText:
-        '¡Hola! Soy el configurador de Jarvi Stock (5 preguntas rápidas).\n\nPregunta 1/5: ¿Cuál es el nombre de tu negocio y su giro comercial? (Ej. "Repuestos MotoASAP - Repuestos de moto")',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    return onboardingReply(
+      `¡Hola! Soy el configurador de Jarvi Stock (${ONBOARDING_TOTAL} preguntas rápidas). Al terminar tendrás tu propio negocio con dos agentes, y este número quedará como dueño.\n\nPregunta 1/${ONBOARDING_TOTAL}: ¿Cuál es el nombre de tu negocio y su giro comercial? (Ej. "Repuestos MotoASAP - Repuestos de moto")`
+    );
   }
 
   const step = conv.onboarding_step || 1;
@@ -195,82 +203,47 @@ async function handleOnboardingStep(tenant, fromPhone, text, existingConv) {
 
   if (step === 1) {
     const parts = text.split(/[-–|]/);
-    ctx.businessName = (parts[0] || text).trim();
+    ctx.businessName = (parts[0] || text).trim() || 'Negocio nuevo';
     ctx.businessIndustry = (parts[1] || 'Comercio sin inventario propio').trim();
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 2,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 2/5: ¿Con qué nombre quieres activar a tu asistente privado? (Ej. "Jarvis")',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    await updateConversation(tenantId, conv.id, { onboarding_step: 2, context_json: ctx });
+    return onboardingReply(
+      `Pregunta 2/${ONBOARDING_TOTAL}: ¿Con qué nombre quieres activar a tu asistente privado? (Ej. "Jarvis")`
+    );
   }
 
   if (step === 2) {
-    ctx.activationName = text.trim() || 'Jarvis';
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 3,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 3/5: Confirma el número WhatsApp del dueño autorizado (ej. 50688888888):',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    ctx.activationName = text.trim().slice(0, 60) || 'Jarvis';
+    await updateConversation(tenantId, conv.id, { onboarding_step: 3, context_json: ctx });
+    return onboardingReply(
+      `Pregunta 3/${ONBOARDING_TOTAL}: ¿Qué margen de ganancia (%) sugerido deseas por defecto? (Ej. 35)`
+    );
   }
 
   if (step === 3) {
-    ctx.ownerWhatsapp = normalizePhone(text) || normalizePhone(fromPhone);
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 4,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 4/5: ¿Qué margen de ganancia (%) sugerido deseas por defecto? (Ej. 35)',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
-  }
-
-  if (step === 4) {
     const numMatch = text.match(/(\d+(?:[.,]\d+)?)/);
-    ctx.defaultMargin = numMatch ? Math.min(90, Math.max(5, Number(numMatch[1]))) : 40;
-    await updateConversation(tenant.id, conv.id, {
-      onboarding_step: 5,
-      context_json: ctx,
-    });
-    return {
-      replyText:
-        'Pregunta 5/5: ¿Qué regla aplicamos si un cliente pregunta por algo fuera de catálogo? (Ej. "Escalar al dueño por WhatsApp")',
-      replyMediaUrl: null,
-      createdPendingAction: null,
-      mode: 'onboarding',
-    };
+    ctx.defaultMargin = numMatch
+      ? Math.min(90, Math.max(5, Number(numMatch[1].replace(',', '.'))))
+      : 40;
+    await updateConversation(tenantId, conv.id, { onboarding_step: 4, context_json: ctx });
+    return onboardingReply(
+      `Pregunta 4/${ONBOARDING_TOTAL}: ¿Qué regla aplicamos si un cliente pregunta por algo fuera de catálogo? (Ej. "Escalar al dueño por WhatsApp")`
+    );
   }
 
   ctx.handoffRule =
     text.trim() || 'Escalar al dueño por WhatsApp y pausar respuestas automáticas';
+  // El dueño es siempre quien completó la entrevista.
+  ctx.ownerWhatsapp = normalizePhone(fromPhone);
 
-  const deployed = await deployOnboardingAgents(tenant.id, ctx);
-  await updateConversation(tenant.id, conv.id, {
-    channel_mode: 'owner',
-    onboarding_step: null,
-    context_json: ctx,
-  });
+  const newTenant = await createTenantFromOnboarding(ctx);
+  const deployed = await deployOnboardingAgents(newTenant.id, ctx);
+  await updateConversation(tenantId, conv.id, { onboarding_step: null, context_json: ctx });
 
+  const publicCode = deployed.agents?.attention?.activation_code;
   return {
-    replyText: `¡Listo! Desplegamos tus dos agentes para "${ctx.businessName}":\n1) Asistente privado "${ctx.activationName}" (Código: ${deployed.activationCode})\n2) Agente público de atención al cliente (oculta costos y proveedores).\nTope mensual: ${deployed.usageCaps.monthlyMsgLimit} mensajes.`,
-    replyMediaUrl: null,
-    createdPendingAction: null,
-    mode: 'onboarding',
+    ...onboardingReply(
+      `¡Listo! Creamos tu negocio "${ctx.businessName}" con dos agentes:\n1) Asistente privado "${ctx.activationName}" (solo te responde a ti). Código: ${deployed.activationCode}\n2) Agente público de atención al cliente (oculta costos y proveedores). Código para tus clientes: ${publicCode}\nTope mensual: ${deployed.usageCaps.monthlyMsgLimit} mensajes.`
+    ),
     onboardingResult: deployed,
   };
 }
@@ -601,7 +574,11 @@ export async function processMessage({
   }
 
   const normalized = normalizeText(text).trim();
-  const activeOnboarding = await findActiveOnboardingConversation(tenant.id, fromPhone);
+  // Las entrevistas viven en el negocio de la fábrica, no en el del número que recibe.
+  const activeOnboarding = await findActiveOnboardingConversation(
+    FACTORY_TENANT_ID,
+    fromPhone
+  );
   const startsOnboarding =
     normalized.startsWith('#onboarding') || normalized.startsWith('#activar');
 
@@ -615,13 +592,14 @@ export async function processMessage({
     }
   }
 
-  const agents = await listAgents(tenant.id);
+  const convTenantId = mode === 'onboarding' ? FACTORY_TENANT_ID : tenant.id;
+  const agents = mode === 'onboarding' ? [] : await listAgents(tenant.id);
   const selectedAgent = agents.find((a) =>
     mode === 'owner' ? a.type === 'personal' : a.type === 'attention'
   );
 
   const conversation = await getOrCreateConversation(
-    tenant.id,
+    convTenantId,
     fromPhone,
     mode,
     selectedAgent?.id || null
@@ -629,14 +607,14 @@ export async function processMessage({
 
   let result;
   if (mode === 'onboarding') {
-    result = await handleOnboardingStep(tenant, fromPhone, text, activeOnboarding);
+    result = await handleOnboardingStep(fromPhone, text, activeOnboarding);
   } else if (mode === 'owner') {
     result = await handleOwnerMode(tenant, fromPhone, text, mediaUrl);
   } else {
     result = await handleClientMode(tenant, fromPhone, text);
   }
 
-  await insertOutboundMessage(tenant.id, {
+  await insertOutboundMessage(convTenantId, {
     conversation_id: conversation.id,
     wa_message_id: messageId ? `${messageId}:reply` : null,
     sender_phone: 'system',
