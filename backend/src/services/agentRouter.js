@@ -27,6 +27,7 @@ import {
   formatColones,
   notifyOwnersOfPendingAction,
 } from './pendingActions.js';
+import { interpretOwnerMessage } from './ownerIntent.js';
 
 function normalizeText(value) {
   return String(value || '')
@@ -296,6 +297,39 @@ function ownerReply(replyText, extra = {}) {
   return { replyText, replyMediaUrl: null, createdPendingAction: null, mode: 'owner', ...extra };
 }
 
+function findSupplierByName(suppliers, name) {
+  if (!name) return null;
+  return suppliers.find((s) => normalizeText(s.name) === normalizeText(name)) || null;
+}
+
+// Datos que faltan para registrar un producto. Con IA no se inventan precios
+// ni proveedores: se le pregunta al dueño.
+function missingProductFields(ai, suppliers) {
+  const missing = [];
+  if (!ai.costPrice && !ai.salePrice) missing.push('el costo');
+  if (!ai.supplierName) missing.push('el proveedor');
+  else if (!ai.supplierPhone && !findSupplierByName(suppliers, ai.supplierName)?.whatsapp_phone) {
+    missing.push(`el WhatsApp de ${ai.supplierName}`);
+  }
+  return missing;
+}
+
+// Convierte la intención de la IA al mismo formato que parseOwnerSaveCommand().
+function intentToSaveCommand(ai, suppliers, defaultMarginPct) {
+  if (ai.intent !== 'create_product') return null;
+  const margin = Math.max(0.1, 1 - defaultMarginPct / 100);
+  const costPrice = ai.costPrice || Math.round(ai.salePrice * margin);
+  const salePrice = ai.salePrice || Math.round(costPrice / margin);
+  const known = findSupplierByName(suppliers, ai.supplierName);
+  return {
+    productName: ai.productName.charAt(0).toUpperCase() + ai.productName.slice(1),
+    costPrice,
+    salePrice,
+    supplierName: known?.name || ai.supplierName,
+    supplierPhone: ai.supplierPhone || known?.whatsapp_phone,
+  };
+}
+
 async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
   const wakeWord = tenant.activation_name || 'Jarvis';
   const defaultMargin = Number(tenant.default_margin || 40);
@@ -330,8 +364,26 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
     );
   }
 
-  const parsedSave = parseOwnerSaveCommand(text, defaultMargin);
-  if (parsedSave || mediaUrl) {
+  // Con IA: entiende lenguaje natural ("me llegó X de MotoASAP a 18 mil").
+  // Sin IA (o si falla): reglas por palabras clave, como antes.
+  const ai = await interpretOwnerMessage({ text, hasImage: Boolean(mediaUrl) });
+
+  if (ai?.intent === 'create_product') {
+    const missing = missingProductFields(ai, suppliers);
+    if (missing.length > 0) {
+      return {
+        replyText: `Para registrar "${ai.productName}" me falta: ${missing.join(', ')}. Envíamelo en un solo mensaje y lo preparo para tu confirmación.`,
+        replyMediaUrl: null,
+        createdPendingAction: null,
+        mode: 'owner',
+      };
+    }
+  }
+
+  const parsedSave = ai
+    ? intentToSaveCommand(ai, suppliers, defaultMargin)
+    : parseOwnerSaveCommand(text, defaultMargin);
+  if (parsedSave || (mediaUrl && !ai)) {
     const productName = parsedSave?.productName || 'Producto detectado por imagen';
     const costPrice = parsedSave?.costPrice || 12000;
     const salePrice =
@@ -399,7 +451,10 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
   }
 
   const normalized = normalizeText(text);
-  if (normalized.includes('ruta') || normalized.includes('recogida')) {
+  const wantsRoute = ai
+    ? ai.intent === 'pickup_route'
+    : normalized.includes('ruta') || normalized.includes('recogida');
+  if (wantsRoute) {
     const stops = await getDailyPickupRoute(tenant.id);
     if (stops.length === 0) {
       return {
@@ -425,12 +480,14 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
     };
   }
 
-  const matched = findMatchingProducts(text, products);
-  const wantsPurchase =
-    normalized.includes('pide') ||
-    normalized.includes('pedir') ||
-    normalized.includes('ordena') ||
-    normalized.includes('compra');
+  const searchText = ai?.searchQuery || text;
+  const matched = findMatchingProducts(searchText, products);
+  const wantsPurchase = ai
+    ? ai.intent === 'purchase_order'
+    : normalized.includes('pide') ||
+      normalized.includes('pedir') ||
+      normalized.includes('ordena') ||
+      normalized.includes('compra');
 
   if (matched.length > 0) {
     const top = matched[0];
@@ -500,7 +557,7 @@ async function handleOwnerMode(tenant, fromPhone, text, mediaUrl) {
       ...pa.payload_json.product,
       supplier_name: pa.payload_json.supplierName || 'Proveedor Local',
     }));
-  const matchedPending = findMatchingProducts(text, pendingProducts);
+  const matchedPending = findMatchingProducts(searchText, pendingProducts);
   if (matchedPending.length > 0) {
     const p = matchedPending[0];
     return {
